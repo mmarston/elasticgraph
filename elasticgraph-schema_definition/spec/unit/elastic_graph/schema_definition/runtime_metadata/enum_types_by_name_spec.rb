@@ -198,6 +198,21 @@ module ElasticGraph
         )
       end
 
+      it "doesn't allow an enum value that conflicts with MISSING_ENUM_PLACEHOLDER" do
+        expect do
+          # The placeholder "**missing**" contains special characters that are not allowed
+          # in GraphQL enums, so it can never conflict with a valid enum value.
+          # This test documents that behavior.
+          enum_type_metadata_for "Status" do |s|
+            s.enum_type "Status" do |t|
+              t.value "ACTIVE"
+              t.value "INACTIVE"
+              t.value MISSING_ENUM_PLACEHOLDER
+            end
+          end
+        end.to raise_error(Errors::InvalidGraphQLNameError)
+      end
+
       def enum_type_metadata_for(name, expect_matching_input: false, **schema_options, &block)
         enum_types_by_name = define_schema(**schema_options, &block).runtime_metadata.enum_types_by_name
 

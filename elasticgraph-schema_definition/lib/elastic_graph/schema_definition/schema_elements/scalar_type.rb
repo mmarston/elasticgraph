@@ -44,6 +44,7 @@ module ElasticGraph
       class ScalarType < Struct.new(
         :schema_def_state,
         :type_ref,
+        :grouping_missing_value_placeholder_overridden,
         :mapping_type,
         :runtime_metadata,
         :aggregated_values_customizations,
@@ -66,7 +67,7 @@ module ElasticGraph
 
         # @private
         def initialize(schema_def_state, name)
-          super(schema_def_state, schema_def_state.type_ref(name).to_final_form)
+          super(schema_def_state, schema_def_state.type_ref(name).to_final_form, false)
 
           # Default the runtime metadata before yielding, so it can be overridden as needed.
           self.runtime_metadata = SchemaArtifacts::RuntimeMetadata::ScalarType.new(
@@ -84,6 +85,10 @@ module ElasticGraph
 
           if missing.any?
             raise Errors::SchemaError, "Scalar types require `mapping` and `json_schema` to be configured, but `#{name}` lacks #{missing.join(" and ")}."
+          end
+
+          inferred_grouping_missing_value_placeholder&.tap do |placeholder|
+            self.runtime_metadata = runtime_metadata.with(grouping_missing_value_placeholder: placeholder)
           end
         end
 
@@ -153,6 +158,27 @@ module ElasticGraph
             "name" => preparer_name,
             "require_path" => defined_at
           }).tap(&:load_indexing_preparer) # verify the preparer is valid.
+        end
+
+        # Specifies a placeholder value to use for missing values when grouping by this scalar type.
+        # This optimization allows ElasticGraph to use a single terms aggregation instead of separate
+        # terms and missing aggregations, reducing the exponential explosion of subaggregations when
+        # grouping by multiple fields.
+        #
+        # @param placeholder [String] the placeholder value to use for missing/null values
+        # @return [void]
+        #
+        # @example Define a grouping missing value placeholder
+        #   ElasticGraph.define_schema do |schema|
+        #     schema.scalar_type "BigInt" do |t|
+        #       t.mapping type: "long"
+        #       t.json_schema type: "integer", minimum: -(2**53) + 1, maximum: (2**53) - 1
+        #       t.grouping_missing_value_placeholder "NaN"
+        #     end
+        #   end
+        def grouping_missing_value_placeholder(placeholder)
+          self.grouping_missing_value_placeholder_overridden = true
+          self.runtime_metadata = runtime_metadata.with(grouping_missing_value_placeholder: placeholder)
         end
 
         # @return [String] the GraphQL SDL form of this scalar
@@ -311,9 +337,38 @@ module ElasticGraph
           schema_def_state.factory.new_aggregated_values_type_for_index_leaf_type(name, &customization_block)
         end
 
+        def inferred_grouping_missing_value_placeholder
+          return nil if grouping_missing_value_placeholder_overridden || mapping_type.nil?
+
+          if STRING_TYPES.include?(mapping_type)
+            MISSING_STRING_PLACEHOLDER
+          elsif FLOAT_TYPES.include?(mapping_type)
+            MISSING_NUMERIC_PLACEHOLDER
+          elsif mapping_type == "long"
+            # It is only safe to use NaN for a long when the long's range is safe to coerce to a float
+            # without loss of precision. This is because using NaN as the missing value will cause
+            # the datastore to coerce the other bucket keys to float.
+            MISSING_NUMERIC_PLACEHOLDER if json_schema_options.key?(:minimum) &&
+              json_schema_options.key?(:maximum) &&
+              json_schema_options[:minimum] >= JSON_SAFE_LONG_MIN &&
+              json_schema_options[:maximum] <= JSON_SAFE_LONG_MAX
+          elsif mapping_type == "unsigned_long"
+            # Similar to the checks above for long except we only need to check the max
+            # (since the min is zero even if not specified)
+            MISSING_NUMERIC_PLACEHOLDER if json_schema_options.key?(:maximum) &&
+              json_schema_options[:maximum] <= JSON_SAFE_LONG_MAX
+          elsif INTEGER_TYPES.include?(mapping_type)
+            # All other integer types can safely be coerced to float without loss of precision
+            MISSING_NUMERIC_PLACEHOLDER
+          end
+        end
+
         # https://www.elastic.co/guide/en/elasticsearch/reference/current/mapping-types.html
         # https://www.elastic.co/guide/en/elasticsearch/reference/7.13/number.html#number
-        NUMERIC_TYPES = %w[long integer short byte double float half_float scaled_float unsigned_long].to_set
+        FLOAT_TYPES = %w[double float half_float scaled_float].to_set
+        INTEGER_TYPES = %w[long integer short byte unsigned_long].to_set
+        NUMERIC_TYPES = FLOAT_TYPES | INTEGER_TYPES
+        STRING_TYPES = %w[keyword text].to_set
         DATE_TYPES = %w[date date_nanos].to_set
         # The Elasticsearch/OpenSearch docs do not exhaustively give a list of types on which range queries are efficient,
         # but the docs are clear that it is efficient on numeric and date types, and is inefficient on string
