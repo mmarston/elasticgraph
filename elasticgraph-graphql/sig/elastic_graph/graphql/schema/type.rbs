@@ -20,6 +20,7 @@ module ElasticGraph
         def indexed_document?: () -> bool
         def indexed_aggregation?: () -> bool
         def enum_value_named: (::String) -> EnumValue
+        def grouping_missing_value_placeholder: () -> ::String?
       end
     end
   end
